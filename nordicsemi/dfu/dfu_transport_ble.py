@@ -36,25 +36,23 @@
 #
 
 # Python standard library
-import os
-import sys
-import Queue
 import struct
 import logging
 import binascii
 
-from nordicsemi.dfu.dfu_transport   import DfuTransport, DfuEvent
-from pc_ble_driver_py.exceptions    import NordicSemiException, IllegalStateException
-from pc_ble_driver_py.ble_driver    import BLEDriver, BLEDriverObserver, BLEEnableParams, BLEUUIDBase, BLEUUID, BLEAdvData, BLEGapConnParams, NordicSemiException
-from pc_ble_driver_py.ble_driver    import ATT_MTU_DEFAULT
-from pc_ble_driver_py.ble_adapter   import BLEAdapter, BLEAdapterObserver, EvtSync
+from nordicsemi.dfu.dfu_transport       import DfuTransport, DfuEvent
+from pc_ble_driver_py                   import config
+from pc_ble_driver_py                   import nrf_types
+from pc_ble_driver_py                   import nrf_event
+from pc_ble_driver_py.exceptions        import NordicSemiException, IllegalStateException
+from pc_ble_driver_py.gattc             import GattClient
+from pc_ble_driver_py.nrf_adapter       import NrfAdapter
+from pc_ble_driver_py.nrf_driver        import NrfDriver
+from pc_ble_driver_py.nrf_event_sync    import EventSync
+from pc_ble_driver_py.observers         import NrfAdapterObserver, GattClientObserver
 
 logger  = logging.getLogger(__name__)
 #logger.setLevel(logging.DEBUG)
-
-from pc_ble_driver_py import config
-global nrf_sd_ble_api_ver
-nrf_sd_ble_api_ver = config.sd_api_ver_get()
 
 
 class ValidationException(NordicSemiException):
@@ -64,130 +62,139 @@ class ValidationException(NordicSemiException):
     pass
 
 
-
-class DFUAdapter(BLEDriverObserver, BLEAdapterObserver):
-    BASE_UUID   = BLEUUIDBase([0x8E, 0xC9, 0x00, 0x00, 0xF3, 0x15, 0x4F, 0x60,
-                               0x9F, 0xB8, 0x83, 0x88, 0x30, 0xDA, 0xEA, 0x50])
-    CP_UUID     = BLEUUID(0x0001, BASE_UUID)
-    DP_UUID     = BLEUUID(0x0002, BASE_UUID)
-
-    LOCAL_ATT_MTU     = 23
+class DFUAdapter(NrfAdapterObserver):
+    BASE_UUID       = nrf_types.BLEUUIDBase(
+                        [0x8E, 0xC9, 0x00, 0x00, 0xF3, 0x15, 0x4F, 0x60,
+                         0x9F, 0xB8, 0x83, 0x88, 0x30, 0xDA, 0xEA, 0x50])
+    CP_UUID         = nrf_types.BLEUUID(0x0001, BASE_UUID)
+    DP_UUID         = nrf_types.BLEUUID(0x0002, BASE_UUID)
+    LOCAL_ATT_MTU   = 23
 
     def __init__(self, adapter):
         super(DFUAdapter, self).__init__()
-        self.evt_sync           = EvtSync(['connected', 'disconnected'])
-        self.conn_handle        = None
-        self.adapter            = adapter
-        self.notifications_q    = Queue.Queue()
+        self.adapter    = adapter
+        self.cp_handle  = None
+        self.cp_uuid    = None
+        self.dp_handle  = None
         self.adapter.observer_register(self)
-        self.adapter.driver.observer_register(self)
-
 
     def open(self):
         self.adapter.driver.open()
-        ble_enable_params = BLEEnableParams(vs_uuid_count      = 10,
-                                            service_changed    = False,
-                                            periph_conn_count  = 0,
-                                            central_conn_count = 1,
-                                            central_sec_count  = 1)
-        if nrf_sd_ble_api_ver >= 3:
+        ble_enable_params = nrf_types.BLEEnableParams(
+                vs_uuid_count      = 10, service_changed    = False,
+                periph_conn_count  =  0, central_conn_count = 1,
+                central_sec_count  =  1)
+        if config.sd_api_ver_get() >= 3:
             logger.info("\nBLE: ble_enable with local ATT MTU: {}".format(DFUAdapter.LOCAL_ATT_MTU))
             ble_enable_params.att_mtu = DFUAdapter.LOCAL_ATT_MTU
 
         self.adapter.driver.ble_enable(ble_enable_params)
         self.adapter.driver.ble_vs_uuid_add(DFUAdapter.BASE_UUID)
 
-    def connect(self, target_device_name, target_device_addr):
-        self.target_device_name = target_device_name
-        self.target_device_addr = target_device_addr
-        logger.debug('BLE: connect: target address: 0x{}'.format(self.target_device_addr))
-        logger.info('BLE: Scanning...')
-        self.adapter.driver.ble_gap_scan_start()
-        self.conn_handle = self.evt_sync.wait('connected')
-        if self.conn_handle is None:
-            raise NordicSemiException('Timeout. Target device not found.')
-        logger.info('BLE: Connected to target')
-        logger.debug('BLE: Service Discovery')
+    def close(self):
+        self.adapter.close()
 
-        if nrf_sd_ble_api_ver >= 3:
-            if DFUAdapter.LOCAL_ATT_MTU > ATT_MTU_DEFAULT:
+    def _get_device_name(self, event):
+        if nrf_types.BLEAdvData.Types.complete_local_name in event.adv_data.records:
+            dev_name_list = event.adv_data.records[nrf_types.BLEAdvData.Types.complete_local_name]
+            return "".join(chr(e) for e in dev_name_list)
+        elif nrf_types.BLEAdvData.Types.short_local_name in event.adv_data.records:
+            dev_name_list = event.adv_data.records[nrf_types.BLEAdvData.Types.short_local_name]
+            return "".join(chr(e) for e in dev_name_list)
+        return ""
+
+    def _get_device_addr(self, event):
+        return "".join("{0:02X}".format(b) for b in event.peer_addr.addr)
+
+    def _find_service_handles(self, services):
+        cp_uuid     =  DFUAdapter.CP_UUID.base.base[:]
+        cp_uuid[2]  = (DFUAdapter.CP_UUID.value >> 8) & 0xff
+        cp_uuid[3]  = (DFUAdapter.CP_UUID.value >> 0) & 0xff
+        dp_uuid     =  DFUAdapter.DP_UUID.base.base[:]
+        dp_uuid[2]  = (DFUAdapter.DP_UUID.value >> 8) & 0xff
+        dp_uuid[3]  = (DFUAdapter.DP_UUID.value >> 0) & 0xff
+        cccd_uuid   = nrf_types.BLEUUID(nrf_types.BLEUUID.Standard.cccd)
+
+        for service in services:
+            for char in service.chars:
+                char_data_decl_uuid = list(reversed(char.data_decl[3:])) # TODO: Really?
+                if cp_uuid == char_data_decl_uuid:
+                    self.cp_handle = char.handle_value
+                if dp_uuid == char_data_decl_uuid:
+                    self.dp_handle = char.handle_value
+                for descr in char.descs:
+                    if cp_uuid == char_data_decl_uuid and descr.uuid == cccd_uuid:
+                        self.cp_cccd = descr.handle
+
+        if None in [self.cp_handle, self.cp_cccd, self.dp_handle]:
+            raise NordicSemiException('Did not find expected services')
+
+    def connect(self, target_device_name, target_device_addr):
+        logger.info('BLE: scanning: target address: 0x{}'.format(target_device_addr))
+
+        def scan_for_device(event):
+            if not event.evt_id == nrf_event.GapEvtAdvReport.evt_id:
+                return True
+            if target_device_name and target_device_name == self._get_device_name(event):
+                return False
+            if target_device_addr and target_device_addr == self._get_device_addr(event):
+                return False
+            return True
+
+        with EventSync(self.adapter, callback=scan_for_device) as evt_sync:
+            self.adapter.driver.ble_gap_scan_start()
+            event = evt_sync.get(timeout=5)
+
+            if event is None:
+                raise NordicSemiException('Timeout, unable to connect to device.')
+            self.adapter.driver.ble_gap_scan_stop()
+
+            self.gattc  = GattClient(self.adapter, event.peer_addr)
+
+        proc_sync = self.gattc.connect().wait(5)
+        if not proc_sync.status:
+            raise NordicSemiException('Timeout, unable to connect to device.')
+
+        if config.sd_api_ver_get() >= 3:
+            if DFUAdapter.LOCAL_ATT_MTU > self.adapter.driver.ATT_MTU_DEFAULT:
                 logger.info('BLE: Enabling longer ATT MTUs')
-                self.att_mtu = self.adapter.att_mtu_exchange(self.conn_handle)
+                self.att_mtu = self.adapter.att_mtu_exchange(self.gattc.conn_handle)
                 logger.info('BLE: ATT MTU: {}'.format(self.att_mtu))
             else:
                 logger.info('BLE: Using default ATT MTU')
 
-        self.adapter.service_discovery(conn_handle=self.conn_handle)
+        logger.info('BLE: Connected to target, doing service discovery')
+        services = self.gattc.get_peer_db()
+        self._find_service_handles(services)
+
         logger.debug('BLE: Enabling Notifications')
-        self.adapter.enable_notification(conn_handle=self.conn_handle, uuid=DFUAdapter.CP_UUID)
-        return self.target_device_name, self.target_device_addr
+        self.gattc.enable_notification(self.cp_cccd)
 
-    def close(self):
-        if self.conn_handle is not None:
-            logger.info('BLE: Disconnecting from target')
-            self.adapter.disconnect(self.conn_handle)
-            self.evt_sync.wait('disconnected')
-        self.adapter.driver.close()
-
+    def cp_notification_filter(self, event):
+        if not event.evt_id == nrf_event.GattcEvtHvx.evt_id:
+            return True
+        if not self.gattc.conn_handle == event.conn_handle:
+            return True
+        if not event.attr_handle == self.cp_handle:
+            return True
+        return False
 
     def write_control_point(self, data):
-        self.adapter.write_req(self.conn_handle, DFUAdapter.CP_UUID, data)
-
+        with EventSync(self.adapter, callback=self.cp_notification_filter) as evt_sync:
+            self.gattc.write(self.cp_handle, data)
+            event = evt_sync.get()
+            return event
 
     def write_data_point(self, data):
-        self.adapter.write_cmd(self.conn_handle, DFUAdapter.DP_UUID, data)
+        self.gattc.write_cmd(self.dp_handle, data)
+
+    #def on_att_mtu_exchanged(self, ble_driver, conn_handle, att_mtu):
+    #    logger.info('ATT MTU exchanged: conn_handle={} att_mtu={}'.format(conn_handle, att_mtu))
 
 
-    def on_gap_evt_connected(self, ble_driver, conn_handle, peer_addr, role, conn_params):
-        self.evt_sync.notify(evt = 'connected', data = conn_handle)
-        logger.info('BLE: Connected to {}'.format(peer_addr))
+    #def on_gattc_evt_exchange_mtu_rsp(self, ble_driver, conn_handle, **kwargs):
+    #    logger.info('ATT MTU exchange response: conn_handle={}'.format(conn_handle))
 
-
-    def on_gap_evt_disconnected(self, ble_driver, conn_handle, reason):
-        self.evt_sync.notify(evt = 'disconnected', data = conn_handle)
-        self.conn_handle = None
-        logger.info('BLE: Disconnected')
-
-
-    def on_gap_evt_adv_report(self, ble_driver, conn_handle, peer_addr, rssi, adv_type, adv_data):
-        dev_name_list = []
-        if BLEAdvData.Types.complete_local_name in adv_data.records:
-            dev_name_list = adv_data.records[BLEAdvData.Types.complete_local_name]
-
-        elif BLEAdvData.Types.short_local_name in adv_data.records:
-            dev_name_list = adv_data.records[BLEAdvData.Types.short_local_name]
-
-        dev_name        = "".join(chr(e) for e in dev_name_list)
-        address_string  = "".join("{0:02X}".format(b) for b in peer_addr.addr)
-        logger.debug('Received advertisement report, address: 0x{}, device_name: {}'.format(address_string, dev_name))
-
-        if (dev_name == self.target_device_name) or (address_string == self.target_device_addr):
-            conn_params = BLEGapConnParams(min_conn_interval_ms = 15,
-                                           max_conn_interval_ms = 30,
-                                           conn_sup_timeout_ms  = 4000,
-                                           slave_latency        = 0)
-            logger.info('BLE: Found target advertiser, address: 0x{}, name: {}'.format(address_string, dev_name))
-            logger.info('BLE: Connecting to 0x{}'.format(address_string))
-            self.adapter.connect(address = peer_addr, conn_params = conn_params)
-            # store the name and address for subsequent connections
-            self.target_device_name = dev_name
-            self.target_device_addr = address_string
-
-
-    def on_notification(self, ble_adapter, conn_handle, uuid, data):
-        if self.conn_handle         != conn_handle: return
-        if DFUAdapter.CP_UUID.value != uuid.value:  return
-        #logger.debug(data)
-        self.notifications_q.put(data)
-
-
-    def on_att_mtu_exchanged(self, ble_driver, conn_handle, att_mtu):
-        logger.info('ATT MTU exchanged: conn_handle={} att_mtu={}'.format(conn_handle, att_mtu))
-
-
-    def on_gattc_evt_exchange_mtu_rsp(self, ble_driver, conn_handle, **kwargs):
-        logger.info('ATT MTU exchange response: conn_handle={}'.format(conn_handle))
-    
 
 
 class DfuTransportBle(DfuTransport):
@@ -201,7 +208,7 @@ class DfuTransportBle(DfuTransport):
                  serial_port,
                  target_device_name=None,
                  target_device_addr=None,
-                 baud_rate=115200,
+                 baud_rate=1000000,
                  prn=0):
         super(DfuTransportBle, self).__init__()
         self.baud_rate          = baud_rate
@@ -216,23 +223,22 @@ class DfuTransportBle(DfuTransport):
             raise IllegalStateException('DFU Adapter is already open')
 
         super(DfuTransportBle, self).open()
-        driver           = BLEDriver(serial_port    = self.serial_port,
-                                     baud_rate      = self.baud_rate)
-        adapter          = BLEAdapter(driver)
-        self.dfu_adapter = DFUAdapter(adapter       = adapter)
+        driver              = NrfDriver(self.serial_port, self.baud_rate)
+        self.adapter        = NrfAdapter(driver)
+        self.dfu_adapter    = DFUAdapter(self.adapter)
         self.dfu_adapter.open()
-        self.target_device_name, self.target_device_addr = self.dfu_adapter.connect(
-                                                        target_device_name = self.target_device_name,
-                                                        target_device_addr = self.target_device_addr)
+        self.dfu_adapter.connect(
+                target_device_name = self.target_device_name,
+                target_device_addr = self.target_device_addr)
         self.__set_prn()
 
     def close(self):
         if not self.dfu_adapter:
-            raise IllegalStateException('DFU Adapter is already closed')
+            return # Silent ignore already closed
+            #raise IllegalStateException('DFU Adapter is already closed')
         super(DfuTransportBle, self).close()
         self.dfu_adapter.close()
         self.dfu_adapter = None
-
 
     def send_init_packet(self, init_packet):
         def try_to_recover():
@@ -325,117 +331,108 @@ class DfuTransportBle(DfuTransport):
                 raise NordicSemiException("Failed to send firmware")
             self._send_event(event_type=DfuEvent.PROGRESS_EVENT, progress=len(data))
 
-    
     def __set_prn(self):
         logger.debug("BLE: Set Packet Receipt Notification {}".format(self.prn))
-        self.dfu_adapter.write_control_point([DfuTransportBle.OP_CODE['SetPRN']] + map(ord, struct.pack('<H', self.prn)))
-        self.__get_response(DfuTransportBle.OP_CODE['SetPRN'])
-    
+        event = self.dfu_adapter.write_control_point(
+                [DfuTransportBle.OP_CODE['SetPRN']] + map(ord, struct.pack('<H', self.prn)))
+        self.__assert_response(event, DfuTransportBle.OP_CODE['SetPRN'])
+
     def __create_command(self, size):
         self.__create_object(0x01, size)
-
 
     def __create_data(self, size):
         self.__create_object(0x02, size)
 
-
     def __create_object(self, object_type, size):
-        self.dfu_adapter.write_control_point([DfuTransportBle.OP_CODE['CreateObject'], object_type]\
-                                            + map(ord, struct.pack('<L', size)))
-        self.__get_response(DfuTransportBle.OP_CODE['CreateObject'])
-
+        event = self.dfu_adapter.write_control_point(
+                [DfuTransportBle.OP_CODE['CreateObject'], object_type] + map(ord, struct.pack('<L', size)))
+        self.__assert_response(event, DfuTransportBle.OP_CODE['CreateObject'])
 
     def __calculate_checksum(self):
-        self.dfu_adapter.write_control_point([DfuTransportBle.OP_CODE['CalcChecSum']])
-        response = self.__get_response(DfuTransportBle.OP_CODE['CalcChecSum'])
+        event = self.dfu_adapter.write_control_point([DfuTransportBle.OP_CODE['CalcChecSum']])
+        response = self.__assert_response(event, DfuTransportBle.OP_CODE['CalcChecSum'])
 
         (offset, crc) = struct.unpack('<II', bytearray(response))
         return {'offset': offset, 'crc': crc}
 
-
     def __execute(self):
-        self.dfu_adapter.write_control_point([DfuTransportBle.OP_CODE['Execute']])
-        self.__get_response(DfuTransportBle.OP_CODE['Execute'])
-
+        event = self.dfu_adapter.write_control_point([DfuTransportBle.OP_CODE['Execute']])
+        self.__assert_response(event, DfuTransportBle.OP_CODE['Execute'])
 
     def __select_command(self):
         return self.__select_object(0x01)
 
-
     def __select_data(self):
         return self.__select_object(0x02)
 
-
     def __select_object(self, object_type):
         logger.debug("BLE: Selecting Object: type:{}".format(object_type))
-        self.dfu_adapter.write_control_point([DfuTransportBle.OP_CODE['ReadObject'], object_type])
-        response = self.__get_response(DfuTransportBle.OP_CODE['ReadObject'])
+        event = self.dfu_adapter.write_control_point([DfuTransportBle.OP_CODE['ReadObject'], object_type])
+        response = self.__assert_response(event, DfuTransportBle.OP_CODE['ReadObject'])
 
         (max_size, offset, crc)= struct.unpack('<III', bytearray(response))
         logger.debug("BLE: Object selected: max_size:{} offset:{} crc:{}".format(max_size, offset, crc))
         return {'max_size': max_size, 'offset': offset, 'crc': crc}
-    
-    def __get_checksum_response(self):
-        response = self.__get_response(DfuTransportBle.OP_CODE['CalcChecSum'])
+
+    def __get_checksum_response(self, event):
+        response = self.__assert_response(event, DfuTransportBle.OP_CODE['CalcChecSum'])
 
         (offset, crc) = struct.unpack('<II', bytearray(response))
         return {'offset': offset, 'crc': crc}
 
     def __stream_data(self, data, crc=0, offset=0):
         logger.debug("BLE: Streaming Data: len:{0} offset:{1} crc:0x{2:08X}".format(len(data), offset, crc))
-        def validate_crc():
+        def validate_crc(response):
             if (crc != response['crc']):
                 raise ValidationException('Failed CRC validation.\n'\
                                 + 'Expected: {} Recieved: {}.'.format(crc, response['crc']))
             if (offset != response['offset']):
                 raise ValidationException('Failed offset validation.\n'\
                                 + 'Expected: {} Recieved: {}.'.format(offset, response['offset']))
-        
+
         current_pnr     = 0
-        for i in range(0, len(data), DfuTransportBle.DATA_PACKET_SIZE):
-            to_transmit     = data[i:i + DfuTransportBle.DATA_PACKET_SIZE]
-            self.dfu_adapter.write_data_point(map(ord, to_transmit))
-            crc     = binascii.crc32(to_transmit, crc) & 0xFFFFFFFF
-            offset += len(to_transmit)
-            current_pnr    += 1
-            if self.prn == current_pnr:
-                current_pnr = 0
-                response    = self.__get_checksum_response()
-                validate_crc()
+        with EventSync(self.adapter, callback=self.dfu_adapter.cp_notification_filter) as evt_sync:
+            for i in range(0, len(data), DfuTransportBle.DATA_PACKET_SIZE):
+                to_transmit     = data[i:i + DfuTransportBle.DATA_PACKET_SIZE]
+                self.dfu_adapter.write_data_point(map(ord, to_transmit))
+                crc     = binascii.crc32(to_transmit, crc) & 0xFFFFFFFF
+                offset += len(to_transmit)
+                current_pnr    += 1
+                if self.prn == current_pnr:
+                    current_pnr = 0
+                    event = evt_sync.get()
+                    response    = self.__get_checksum_response(event)
+                    validate_crc(response)
 
         response = self.__calculate_checksum()
-        validate_crc()
+        validate_crc(response)
 
         return crc
 
 
-    def __get_response(self, operation):
+    def __assert_response(self, event, operation):
         def get_dict_key(dictionary, value):
             return next((key for key, val in dictionary.items() if val == value), None)
 
-        try:
-            resp = self.dfu_adapter.notifications_q.get(timeout=DfuTransportBle.DEFAULT_TIMEOUT)
-        except Queue.Empty:
+        if event is None:
             raise NordicSemiException('Timeout: operation - {}'.format(get_dict_key(DfuTransportBle.OP_CODE,
                                                                                     operation)))
 
-        if resp[0] != DfuTransportBle.OP_CODE['Response']:
-            raise NordicSemiException('No Response: 0x{:02X}'.format(resp[0]))
+        if event.data[0] != DfuTransportBle.OP_CODE['Response']:
+            raise NordicSemiException('No Response: 0x{:02X}'.format(event.data[0]))
 
-        if resp[1] != operation:
-            raise NordicSemiException('Unexpected Executed OP_CODE.\n' \
-                                    + 'Expected: 0x{:02X} Received: 0x{:02X}'.format(operation, resp[1]))
+        if event.data[1] != operation:
+            raise NordicSemiException('Unexpected Executed OP_CODE.\n'
+                                    + 'Expected: 0x{:02X} Received: 0x{:02X}'.format(operation, event.data[1]))
 
-        if resp[2] == DfuTransport.RES_CODE['Success']:
-            return resp[3:]
-
-
-        elif resp[2] == DfuTransport.RES_CODE['ExtendedError']:
+        if event.data[2] == DfuTransport.RES_CODE['Success']:
+            return event.data[3:]
+        elif event.data[2] == DfuTransport.RES_CODE['ExtendedError']:
             try:
-                data = DfuTransport.EXT_ERROR_CODE[resp[3]]
+                data = DfuTransport.EXT_ERROR_CODE[event.data[3]]
             except IndexError:
-                data = "Unsupported extended error type {}".format(resp[3])
-            raise NordicSemiException('Extended Error 0x{:02X}: {}'.format(resp[3], data))
+                data = "Unsupported extended error type {}".format(event.data[3])
+            raise NordicSemiException('Extended Error 0x{:02X}: {}'.format(event.data[3], data))
         else:
-            raise NordicSemiException('Response Code {}'.format(get_dict_key(DfuTransport.RES_CODE, resp[2])))
+            raise NordicSemiException('Response Code {}'.format(get_dict_key(DfuTransport.RES_CODE, event.data[2])))
 
