@@ -612,6 +612,9 @@ def enumerate_ports():
 @click.option('-p', '--port',
               help='Serial port COM port to which the connectivity IC is connected.',
               type=click.STRING)
+@click.option('-b', '--baudrate',
+              help='Serial port baud rate for the connectivity IC is connected.',
+              type=click.INT)
 @click.option('-n', '--name',
               help='Device name.',
               type=click.STRING)
@@ -625,7 +628,7 @@ def enumerate_ports():
               help='Flash connectivity firmware automatically. Default: disabled.',
               type=click.BOOL,
               is_flag=True)
-def ble(package, conn_ic_id, port, name, address, jlink_snr, flash_connectivity):
+def ble(package, conn_ic_id, port, baudrate, name, address, jlink_snr, flash_connectivity):
     ble_driver_init(conn_ic_id)
     """Perform a Device Firmware Update on a device with a bootloader that supports BLE DFU."""
     if name is None and address is None:
@@ -655,6 +658,7 @@ def ble(package, conn_ic_id, port, name, address, jlink_snr, flash_connectivity)
 
     logger.info("Using connectivity board at serial port: {}".format(port))
     ble_backend = DfuTransportBle(serial_port=str(port),
+                                  baud_rate=baudrate,
                                   target_device_name=str(name),
                                   target_device_addr=str(address))
     ble_backend.register_events_callback(DfuEvent.PROGRESS_EVENT, update_progress)

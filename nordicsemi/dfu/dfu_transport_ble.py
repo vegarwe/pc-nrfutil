@@ -202,16 +202,17 @@ class DfuTransportBle(DfuTransport):
     DATA_PACKET_SIZE    = 20
     DEFAULT_TIMEOUT     = 20
     RETRIES_NUMBER      = 3
+    default_baud_rate   = 115200
 
 
     def __init__(self,
                  serial_port,
                  target_device_name=None,
                  target_device_addr=None,
-                 baud_rate=1000000,
+                 baud_rate=None,
                  prn=0):
         super(DfuTransportBle, self).__init__()
-        self.baud_rate          = baud_rate
+        self.baud_rate          = baud_rate if baud_rate is not None else self.default_baud_rate
         self.serial_port        = serial_port
         self.target_device_name = target_device_name
         self.target_device_addr = target_device_addr
